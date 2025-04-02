@@ -228,6 +228,7 @@ The prominence of the House Committee on Rules at the top of this ranking (with 
 ![](img/Committee_Distinct_Bills_Passed.png)
 
 #### Comparing Methodologies
+Comparing committee importance ranking methodologies, distinct bill passage ranking results in a 25 rank decline for the Senate Committee on Finance followed by a 12 rank decline for the House Committee on Appropriations. This demonstrates the limitations of this alternative methodology for ranking committee importance, which is biased against committees with financial jurisdiction that work on few but very impactful bills.
 ![](img/Committee_Importance_Rank_Shift.png)
 
 #### Data Integration Opportunities for Improved Committee Importance Ranking
