@@ -1,0 +1,1560 @@
+---
+output:
+  html_document: default
+title: "[BRAND]-Storefront-Migration-Analysis"
+author: "William Terpstra"
+date: '`r Sys.Date()``'
+---
+
+```{r setup, include=FALSE}
+# ===== Report Generation Setup =====
+library(tictoc)      # For tracking report run time
+library(furrr)       # For parallelization to generate reports faster
+library(beepr)       # For alerting when report generation is complete
+library(quarto)      # For creating beautiful PDF reports
+library(pdftools)    # For merging pdfs
+library(here)        # For handling working directories
+
+# ===== Data Connection & Manipulation =====
+library(internal_package1)     # [REDACTED] connection
+library(dbplyr)      # Database interactions
+library(tidyverse)   # Data manipulation suite
+library(glue)        # String interpolation
+
+# ===== Date Handling =====
+library(lubridate)   # Date manipulation
+library(internal_package2)      # Custom date utilities
+
+# ===== Visualization & Styling =====
+library(internal_package3)      # Plot styling
+library(scales)      # Axis formatting
+library(RColorBrewer) # Color palettes
+library(extrafont)   # Font handling
+library(googlesheets4) # Report fonts
+
+# ===== Table Generation =====
+library(gt)          # Beautiful tables
+library(webshot)     # Table screenshots
+
+# ===== Fonts, Colors & Themes =====
+extrafont::loadfonts(quiet = TRUE)
+
+brand_new_colors <-   list(
+    "brandMysteriousColor" = "#[REDACTED]",  # progressive red
+    "brandMysteriousColor1" = "#[REDACTED]", 
+    "brandMysteriousColor2" = "#[REDACTED]", 
+    "brandMysteriousColor3" = "#[REDACTED]",
+    "brandLightGray" = "#CCCCCC",
+    "brandDarkGray" = "#323332",
+    "brandBlue" = "#[REDACTED]", 
+    "ultramarine" = "#[REDACTED]", 
+    "brandTaupe" = "#[REDACTED]",
+    "brandBlack" = "#000000"  # Just black
+)
+
+this_palette <- c(brand_new_colors$brandMysteriousColor, brand_new_colors$ultramarine) 
+# This is now a function that will retrieve a # of colors for you between A and B
+gradient_tool <- colorRampPalette(c(this_palette[1], this_palette[2])) 
+
+brand_theme_it_up <- function() {
+  font <- "[BRAND] Type Variable"   #assign font family up front
+  ix_minimal_light(default_text = 10) %+replace%    #replace elements we want to change
+    theme(
+      text = element_text(family = font, size = 10),
+      plot.title = element_text(family = font, size = 12, hjust = 0),
+      plot.subtitle = element_text(family = font, size = 8, hjust = 0, margin = margin(b = 10), color = "#444444"),
+      plot.title.position = "plot",
+      plot.margin = margin(r = 50),
+      panel.grid.major.x = element_line(linetype = "solid"),
+      panel.grid.major.y = element_blank(),
+      plot.background = element_rect(fill = 'transparent', color = NA),
+      legend.title = element_blank(),
+      legend.text = element_text(margin = margin(r = 10),
+                                 size = 10,
+                                 color = "#444444"),
+      legend.spacing.x = unit(1, "mm"),
+      strip.text = element_text(colour = '#444444')
+      # legend.position = "none"
+    )
+}
+
+# Sub-directory for visual outputs
+img_dir_var <- "/img"
+```
+
+```{r Global variables}
+# The comparison range is the number of days for the pre & post window
+# ex 30 is comparing 30 days pre to 30 days post
+# This one is for the plots, and is not truncated on a storefront basis
+plot_comparison_range <- 45
+
+# This one is for the tables, and is truncated on a storefront basis
+# I.e. if the days since the storefront launched are fewer 
+# then the comp is capped at that day number to be valid
+max_table_comparison_range <- 45
+
+# Boolean on whether to use simple channel colors or not
+simple_channels <- TRUE
+
+# This threshold is used to determine positive or negative
+# performance in the performance category column
+perf_threshold <- 25
+
+# Parallelization magic via furrr which combines
+# futures and purrr
+plan(multisession, workers = 6)
+
+options(future.globals.maxSize = 25 * 1024^3)  # 25GB memory cap
+```
+
+```{r Clickstream Connections}
+db_names <- list("prod" = "[REDACTED]", "sandbox" = "[REDACTED]")
+catalog_names <- list("prod" = "[REDACTED]", "sandbox" = "[REDACTED]")
+
+# Database selected
+db_selected <- db_names$prod
+catalog_selected <- catalog_names$prod
+
+# DE set things up so we always use sandbox auth, whether we query prod or sandbox
+internal_package1::aws_system_auth("[REDACTED]", "[REDACTED]")
+internal_package1::aws_auth()
+
+## DB Connection ####
+# Create Athena connection for this role
+athena_con <- internal_package1::athena_connect()
+
+
+analytics_data_hits <-
+     tbl(athena_con,
+         in_catalog(catalog_selected, db_selected, "analytics_data_hits"))
+
+analytics_data_hit_segments <-
+     tbl(athena_con, in_catalog(catalog_selected, db_selected, "analytics_data_hit_segments"))
+
+analytics_data_visit_segments <-
+     tbl(athena_con,
+         in_catalog(catalog_selected, db_selected, "analytics_data_visit_segments"))
+
+analytics_page_lookup <-
+     tbl(athena_con, in_catalog(catalog_selected, db_selected, "analytics_page_lookup"))
+
+
+analytics_channel_lookup <-
+     tbl(athena_con, in_catalog(catalog_selected, db_selected, "analytics_visit_last_touch_lookup"))
+
+# Google Auth
+gs4_auth(email = "[REDACTED]")
+
+# Storefront launch sheet
+storefront_tracker_df_raw <- read_sheet("[REDACTED]", skip = 1)
+
+
+# Select only the name, launch date, and storefront code
+storefront_tracker_df <- storefront_tracker_df_raw %>%
+  select(1, 3, 4, `Storefront Code`)
+names(storefront_tracker_df) <- c("Storefront", "Status", "Launch Date", "Storefront Code")
+
+# Have to do this complicated unnest since the date col has dates and characters
+# since sometimes it contains notes about a launch
+storefront_tracker_df_unnested <- storefront_tracker_df %>%
+  mutate(`Launch Date` = map(`Launch Date`, function(x) {
+    # Try to parse as datetime, if it fails, return NA
+    if(is.character(x)) {
+      # Lets actually start catching errors
+      tryCatch(as.POSIXct(x), error = function(e) NA)
+    } else {
+      x  # Keep as is if already datetime
+    }
+  })) %>%
+  mutate(`Storefront Code` = map(`Storefront Code`, as.character)) %>%
+  # Now unnest both columns with proper type handling
+  unnest(cols = c(`Launch Date`), keep_empty = TRUE) %>%
+  unnest(cols = c(`Storefront Code`), keep_empty = FALSE)
+
+# View the result
+#head(storefront_tracker_df_unnested, 10)
+
+current_storefronts_df <- storefront_tracker_df_unnested %>% 
+  filter((Sys.Date() - 1) >= as.Date(`Launch Date`) & Status %in% c("Launched", "Prod QA")) %>% 
+  arrange(`Launch Date`)
+
+current_storefronts_df
+```
+
+```{r [BRAND] Clickstream Queries}
+storefront_codes_pattern <- paste(current_storefronts_df$`Storefront Code`, collapse = "|")
+
+min_date <- as.Date((min(current_storefronts_df$`Launch Date`) - days((max_table_comparison_range + 1))))
+
+# Pull metrics of interest by storefront & date from the clickstream
+brand_visits_visitors_and_engaged_visits <- analytics_data_hit_segments %>%
+  filter(hit_date > min_date) %>%
+  select(hit_date,
+         generic_var_1,
+         generic_var_2,
+         generic_var_3,
+         is_new_site_hit,
+         any_global_cta_click_hit,
+         visit_id,
+         visitor_id,
+         primary_lead_submission_hit,
+         secondary_lead_submission_hit,
+         product_detail_page_hit
+         ) %>%
+  distinct() %>%
+  filter(grepl(storefront_codes_pattern, generic_var_1)) %>%
+  # Use SQL window function to properly mark engaged visits
+  mutate(
+    is_engaged_visit = sql("MAX(any_global_cta_click_hit) OVER (PARTITION BY visit_id)")
+  ) %>%
+  group_by(hit_date, generic_var_1) %>%
+  # Calculate metrics
+  summarize(
+    visitors = as.double(n_distinct(case_when(generic_var_3 == "site" ~ visitor_id))),
+    visits = as.double(n_distinct(case_when(generic_var_3 == "site" ~ visit_id))),
+    engaged_visits = as.double(n_distinct(case_when(
+      is_engaged_visit & generic_var_3 == "site" ~ visit_id
+    ))),
+    primary_lead_submission_visits = as.double(n_distinct(case_when(
+      primary_lead_submission_hit ~ visit_id
+    ))),
+    secondary_lead_submissions_visits = as.double(n_distinct(case_when(
+      secondary_lead_submission_hit & is_new_site_hit & generic_var_2 == "digital_leads_form_submit_success" ~ visit_id,
+      secondary_lead_submission_hit & !is_new_site_hit ~ visit_id
+    ))),
+    product_detail_page_visits = as.double(n_distinct(case_when(product_detail_page_hit ~ visit_id)))
+  ) %>%
+  arrange(hit_date) %>%
+  collect() %>%
+  mutate(er_visit = engaged_visits / visits)
+```
+
+```{r [BRAND] Clickstream Queries Continued}
+brand_visits_by_channel <- analytics_data_hits %>%
+  filter(hit_date > as.Date("2024-07-01")) %>%
+  select(hit_date,
+         generic_var_1,
+         generic_var_3,
+         visit_id
+         ) %>%
+  distinct() %>%
+  filter(grepl(storefront_codes_pattern, generic_var_1)) %>%
+  left_join(analytics_channel_lookup %>% select(channel, budget_source, visit_id), 
+            by = "visit_id") %>%
+  group_by(hit_date, generic_var_1, channel, budget_source) %>%
+  summarize(
+    visits = as.double(n_distinct(case_when(generic_var_3 == "site" ~ visit_id)))
+  ) %>%
+  arrange(hit_date) %>%
+  collect()
+
+brand_visits_by_channel_proc <- brand_visits_by_channel %>%
+  mutate(
+    budget_source = case_when(
+      budget_source %in% c(
+        "Regional Other",
+        "Sales Ops",
+        "Brand Other",
+        "Brand PHD",
+        "Regional PHD"
+      ) ~ "[BRAND]",
+      TRUE ~ budget_source
+    ),
+    channel = glue("{channel}-{budget_source}")
+  ) %>%
+  group_by(hit_date, generic_var_1, channel, budget_source) %>%
+  summarize(
+    visits = sum(visits)
+  )
+
+# brand_site_visits <- tbl(athena_con, dbplyr::sql(
+#   glue(
+#     "SELECT DISTINCT
+#       visit_id
+#       , generic_var_4 as page_path
+#     FROM {catalog_selected}.{db_selected}.analytics_data_hit_segments
+#     WHERE hit_date BETWEEN DATE '{start_date}' AND DATE '{end_date}'
+#     AND generic_var_3 = 'site'
+#     "
+#   )
+# )) %>%
+#   collect()
+
+current_storefronts_df %>% select(Storefront, `Launch Date`, `Storefront Code`)
+
+launch_sql <- current_storefronts_df %>% 
+  select(Storefront, `Launch Date`, `Storefront Code`) %>%
+  mutate(row = paste0("('", `Storefront Code`, "', DATE '", `Launch Date`, "')")) %>%
+  pull(row) %>%
+  paste(collapse = ", ")
+
+launch_sql <- paste0("(VALUES ", launch_sql, ") AS local_tbl (generic_var_1, launch_date)")
+
+## For QA or Validation ####
+# brand_visits_by_channel_proc
+# brand_visits_visitors_and_engaged_visits
+# brand_visits_visitors_and_engaged_visits %>% filter(generic_var_1 == current_storefronts_df$`Storefront Code`[current_storefronts_df$Storefront == "[BRAND] [REDACTED]"])
+```
+
+```{r Plot Storefront Functions}
+channel_colors <- c(
+ # Not Paid channels (use lighter shades)
+ "direct-Not Paid" = "#A6CEE3",            # Light blue
+ "display-Not Paid" = "#FF9999",           # Light coral
+ "email-Not Paid" = "#D9D9D9",             # Light gray
+ "organic search-Not Paid" = "#A1D99B",    # Light mint green
+ "organic social-Not Paid" = "#CAB2D6",    # Light purple
+ "referral-Not Paid" = "#FFED6F",          # Light yellow
+ "paid search-Not Paid" = "#FDBF6F",       # Light orange for paid search
+ "paid social-Not Paid" = "#C6DBEF",       # Light blue
+ "other paid-Not Paid" = "#BEBEBE",        # Light gray
+ 
+ # [BRAND]-funded channels (use strongest colors)
+ "paid search-[BRAND]" = "#FF8000",           # Strong orange for paid search
+ "paid social-[BRAND]" = "#1F78B4",           # Strong blue
+ "programmatic display-[BRAND]" = "#33A02C",  # Strong green
+ "programmatic video-[BRAND]" = "#E31A1C",    # Strong red
+ "organic social-[BRAND]" = "#6A3D9A",        # Strong purple
+ "other paid-[BRAND]" = "#B15928",            # Strong brown
+ "direct display-[BRAND]" = "#1A5D8F",        # Strong navy blue
+ "programmatic ott-[BRAND]" = "#FF1493",      # Strong pink
+ 
+ # Storefront-funded channels (use medium intensity colors)
+ "paid search-Storefront" = "#FFA64D",         # Medium orange for paid search
+ "paid social-Storefront" = "#6BAED6",         # Medium blue
+ "other paid-Storefront" = "#74C476",          # Medium green
+ "organic search-Storefront" = "#2CA25F",      # Medium teal
+ "programmatic display-Storefront" = "#FB6A4A",# Medium red
+ "direct-Storefront" = "#9E9AC8"               # Medium purple
+)
+
+simple_channel_colors <- c(
+  "Paid-[BRAND]" = brand_new_colors$brandMysteriousColor,
+  "Paid-Storefront" = brand_new_colors$brandMysteriousColor2,
+  "Not Paid" = brand_new_colors$brandLightGray,
+  "Overall" = "black"
+)
+
+## For Channel Coverage Validation ####
+# brand_visits_by_channel_proc %>% ungroup() %>% distinct(channel) %>% arrange(channel)
+# brand_visits_by_channel_proc %>% separate(channel, sep = "-", into = c("channel","budget_source"))
+```
+
+```{r Plot Storefront Functions}
+# Create a storefront plot
+create_storefront_visit_plot <- function(storefront_code) {
+  # Testing
+  # storefront_code <- "[REDACTED]"
+  
+  # Get storefront info
+  storefront_info <- current_storefronts_df %>% filter(`Storefront Code` == storefront_code)
+  
+  # Skip & warn if storefront not found
+  if (nrow(storefront_info) == 0) {
+    warning(paste("Storefront code", storefront_code, "not found in current_storefronts_df"))
+    return(NULL)
+  }
+  
+  storefront_name <- storefront_info$Storefront
+  launch_date <- as.Date(storefront_info$`Launch Date`)
+  
+  # Calculate date range based on global comparison range
+  start_date <- as.Date(launch_date - lubridate::days(plot_comparison_range))
+  end_date <- as.Date(launch_date + lubridate::days(plot_comparison_range))
+  
+  # Filter queried data to the storefront and date period
+  storefront_data <- brand_visits_visitors_and_engaged_visits %>%
+    filter(
+      generic_var_1 == storefront_code,
+      hit_date >= start_date,
+      hit_date <= end_date,
+    ) %>%
+    mutate(
+      visits = visits,
+      time_period = if_else(hit_date >= launch_date, "after", "before")
+    )
+  
+  # Skip & warn if no data
+  if (nrow(storefront_data) == 0) {
+    warning(paste("No data found for storefront code", storefront_code, "in the specified date range"))
+    return(NULL)
+  }
+  
+  # Create plot using the specific storefront code
+  p <- storefront_data %>%
+    ungroup() %>%
+    ggplot() +
+    geom_line(aes(
+      x = hit_date,
+      y = visits,
+      color = time_period,
+      # This makes the line continuous rather than have a disjuncture :)
+      group = 1
+    ),
+    linewidth = 1) +
+    geom_point(aes(
+      x = hit_date,
+      y = visits,
+      color = time_period
+    )) +
+    scale_y_continuous(
+      expand = c(0, 0),
+      labels = \(x) paste0(scales::comma(x)),
+      limits = c(0, NA)
+    ) +
+    scale_x_date(limits = c(start_date, end_date), date_labels = "%b %d") +
+    scale_color_manual(values = c("after" = brand_new_colors$brandMysteriousColor, "before" = "grey80")) +
+    # Add launch date line
+    # geom_vline(xintercept = as.numeric(launch_date), color = "red", linewidth = 0.75, alpha = .5) +
+    # Themeing function
+    brand_theme_it_up() +
+    # labs
+    labs(
+      y = "Visits",
+      x = "",
+      title = paste0(storefront_name, " Visits"),
+      # subtitle = paste0("Launch Date: ", format(launch_date, "%Y-%m-%d")),
+    ) +
+    guides(
+      color = guide_legend(direction = 'vertical'),
+      linetype = guide_legend(direction = 'vertical')
+    ) +
+    theme(legend.position = "none") +
+    coord_cartesian(clip = "off")
+  
+  return(p)
+}
+
+create_storefront_visit_channel_plot <- function(storefront_code) {
+  # Testing
+  # storefront_code <- "[REDACTED]"
+  
+  # Get storefront info
+  storefront_info <- current_storefronts_df %>%
+    filter(`Storefront Code` == storefront_code)
+  
+  # Skip & warn if storefront not found
+  if (nrow(storefront_info) == 0) {
+    warning(paste(
+      "Storefront code",
+      storefront_code,
+      "not found in current_storefronts_df"
+    ))
+    return(NULL)
+  }
+  
+  storefront_name <- storefront_info$Storefront
+  launch_date <- as.Date(storefront_info$`Launch Date`)
+  
+  # Calculate date range based on global comparison range
+  start_date <- as.Date(launch_date - lubridate::days(plot_comparison_range))
+  end_date <- as.Date(launch_date + lubridate::days(plot_comparison_range))
+  
+  # Filter data for this storefront and date range
+  storefront_data <- brand_visits_by_channel_proc %>%
+    filter(generic_var_1 == storefront_code,
+           hit_date >= start_date,
+           hit_date <= end_date)
+  
+  # Skip & warn if no data
+  if (nrow(storefront_data) == 0) {
+    warning(paste(
+      "No data found for storefront code",
+      storefront_code,
+      "in the specified date range"
+    ))
+    return(NULL)
+  }
+  
+  # Process data differently if simple_channels is TRUE
+  # Which just aggregates channels to only 4 buckets
+  if (simple_channels) {
+    storefront_data <- storefront_data %>%
+      group_by(`generic_var_1`, hit_date, budget_source) %>%
+      summarize(visits = sum(visits), .groups = "drop") %>%
+      mutate(channel = case_when(
+        budget_source != "Not Paid" ~ paste0("Paid-", budget_source),
+        TRUE ~ budget_source
+      ))
+    
+    overall_df <- storefront_data %>% group_by(`generic_var_1`, hit_date) %>%
+      summarize(visits = sum(visits), .groups = "drop") %>%
+      mutate(channel = "Overall", budget_source = "Overall")
+    
+    storefront_data <- rbind(storefront_data, overall_df) %>%
+      mutate(channel = factor(
+        channel,
+        levels = c("Overall", "Not Paid", "Paid-[BRAND]", "Paid-Storefront")
+      ))
+  }
+  
+  # Choose color palette based on simple_channels
+  color_palette <- if (simple_channels) {
+    simple_channel_colors
+  } else {
+    channel_colors
+  }
+  
+  # Create plot using the specific storefront code
+  p <- storefront_data %>%
+    ungroup() %>%
+    ggplot() +
+    geom_line(aes(
+      x = hit_date,
+      y = visits,
+      color = channel,
+      # This makes the line continuous rather than have a disjuncture :)
+      group = channel
+    ),
+    linewidth = 1) +
+    # geom_point(aes(
+    #   x = hit_date,
+    #   y = visits,
+    #   color = time_period
+    # )) +
+    scale_y_continuous(
+      expand = c(0, 0),
+      labels = \(x) paste0(scales::comma(x)),
+      limits = c(0, NA)
+    ) +
+    scale_x_date(limits = c(start_date, end_date),
+                 date_labels = "%b %d") +
+    scale_color_manual(values = color_palette) +
+    # Add launch date line
+    geom_vline(
+      xintercept = as.numeric(launch_date),
+      color = "red",
+      linewidth = 0.75,
+      alpha = .5
+    ) +
+    # Themeing function
+    brand_theme_it_up() +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "pt")) +
+    labs(y = "Visits",
+         x = "",
+         title = paste0(storefront_name, " Visits")) +
+         # subtitle = paste0("Launch Date: ", format(launch_date, "%Y-%m-%d")),) +
+         theme(legend.position = "left") +
+           guides(
+             color = guide_legend(direction = 'vertical'),
+             linetype = guide_legend(direction = 'vertical')
+           ) +
+           coord_cartesian(clip = "off")
+         
+         return(p)
+}
+```
+
+```{r Plot Storefront Functions - Lead Plot}
+create_storefront_lead_plot <- function(storefront_code) {
+  # Testing
+  # storefront_code <- "[REDACTED]"
+  
+  # Get storefront info
+  storefront_info <- current_storefronts_df %>%
+    filter(`Storefront Code` == storefront_code)
+  
+  # Skip & warn if storefront not found
+  if (nrow(storefront_info) == 0) {
+    warning(paste("Storefront code", storefront_code, "not found in current_storefronts_df"))
+    return(NULL)
+  }
+  
+  storefront_name <- storefront_info$Storefront
+  launch_date <- as.Date(storefront_info$`Launch Date`)
+  
+  # Calculate date range based on global comparison range
+  start_date <- as.Date(launch_date - lubridate::days(plot_comparison_range))
+  end_date <- as.Date(launch_date + lubridate::days(plot_comparison_range))
+  
+  # Filter data for this storefront and date range
+  storefront_data <- brand_visits_visitors_and_engaged_visits %>%
+    filter(generic_var_1 == storefront_code,
+           hit_date >= start_date,
+           hit_date <= end_date) %>%
+    pivot_longer(cols = c(primary_lead_submission_visits, secondary_lead_submissions_visits), names_to = "visit_leads") %>%
+    mutate(visit_leads = case_when(visit_leads == "primary_lead_submission_visits" ~ "Primary",
+                                   visit_leads == "secondary_lead_submissions_visits" ~ "Secondary"))
+  
+  # Skip & warn if no data
+  if (nrow(storefront_data) == 0) {
+    warning(paste("No data found for storefront code", storefront_code, "in the specified date range"))
+    return(NULL)
+  }
+  
+  # Create plot using the specific storefront code
+  p <- storefront_data %>%
+    ungroup() %>%
+    ggplot() +
+    geom_col(aes(
+      x = hit_date,
+      y = value,
+      fill = visit_leads,
+      # This makes the line continuous rather than have a disjuncture :)
+      group = visit_leads
+    )) +
+    scale_y_continuous(
+      expand = c(0, 0),
+      labels = \(x) paste0(scales::comma(x)),
+      limits = c(0, NA)
+    ) +
+    scale_x_date(limits = c(start_date, end_date), date_labels = "%b %d") +
+    scale_fill_manual(values = c("Primary" = brand_new_colors$brandMysteriousColor, "Secondary" = brand_new_colors$brandMysteriousColor2)) +
+    # Add launch date line
+    geom_vline(xintercept = as.numeric(launch_date), color = "red", linewidth = 0.75) +
+    geom_vline(xintercept = as.numeric(Sys.Date()-1), color = "grey75", linewidth = 0.75, linetype = "dotted") +
+    # Themeing function
+    brand_theme_it_up() +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "pt")) +
+    labs(
+      y = "Leads (Visits)",
+      x = "",
+      title = paste0(storefront_name, " Leads"),
+      # subtitle = paste0("Launch Date: ", format(launch_date, "%Y-%m-%d"), ", visit scoped"),
+    ) +
+    coord_cartesian(clip = "off")
+  
+  return(p)
+}
+```
+
+```{r Plot Storefront Product Visits}
+# Generate all plots
+storefront_visit_plots <- current_storefronts_df$`Storefront Code` %>%
+  setNames(current_storefronts_df$`Storefront Code`) %>%
+  future_map(create_storefront_visit_plot)
+
+# Show the first visit plot for validation
+storefront_visit_plots[[1]]
+
+# Create output directory if it doesn't exist
+dir.create("Storefront_Plots/Visits", showWarnings = TRUE)
+
+# Save each plot to a file in the correct sub-directory
+# Walk2 is like map2 but called for its side effects rather than outputs
+# ie. it does things rather than returns an output
+# future_walk2 uses future for parallelization magic so work is distributed
+# across multiple R sessions for faster completions
+future_walk2(storefront_visit_plots, names(storefront_visit_plots), function(plot, code) {
+  
+  storefront_name <- current_storefronts_df$Storefront[current_storefronts_df$`Storefront Code` == code]
+  
+  message(paste0("Saving visit plot for storefront ", storefront_name, " (", code, ")...\n"))
+  
+  filename <-
+    paste0(
+      "Storefront_Plots/Visits/",
+      code,
+      "_",
+      gsub("[^[:alnum:]]", "_", storefront_name),
+      "_visits",
+      ".png"
+    )
+  
+  # Try-catch block to handle any errors during save
+  tryCatch({
+    ggsave(
+      plot = plot,
+      filename,
+      width = 7.5,
+      height = 5,
+      units = "in",
+      dpi = 144,
+      bg = "transparent"
+    )
+    message(paste0("  ✓ Successfully saved ", filename, "\n"))
+  }, error = function(e) {
+    message(paste0("  ✗ Error saving ", filename, ": ", e$message, "\n"))
+  })
+})
+```
+
+```{r Plot Storefront Channel}
+# Generate all plots
+storefront_channel_plots <- current_storefronts_df$`Storefront Code` %>%
+  setNames(current_storefronts_df$`Storefront Code`) %>%
+  future_map(create_storefront_visit_channel_plot)
+
+# Show the first channel plot for validation
+storefront_channel_plots[[1]]
+
+# Create output directory if it doesn't exist
+dir.create("Storefront_Plots/Channel", showWarnings = TRUE)
+
+# Save each plot to a file in the correct sub-directory
+future_walk2(storefront_channel_plots, names(storefront_channel_plots), function(plot, code) {
+  
+  storefront_name <- current_storefronts_df$Storefront[current_storefronts_df$`Storefront Code` == code]
+  
+  message(paste0("Saving plot for storefront ", storefront_name, " (", code, ")...\n"))
+  
+  filename <-
+    paste0(
+      "Storefront_Plots/Channel/",
+      code,
+      "_",
+      gsub("[^[:alnum:]]", "_", storefront_name),
+      "_visits",
+      ".png"
+    )
+  
+  # Try-catch block to handle any errors during save
+  tryCatch({
+    ggsave(
+      plot = plot,
+      filename,
+      width = 7,
+      height = 4,
+      units = "in",
+      dpi = 144,
+      # path = paste0(here(), "/Storefront Plots"),
+      bg = "transparent"
+    )
+    message(paste0("  ✓ Successfully saved ", filename, "\n"))
+  }, error = function(e) {
+    message(paste0("  ✗ Error saving ", filename, ": ", e$message, "\n"))
+  })
+})
+```
+
+```{r Plot Storefront Leads}
+# Generate all plots
+storefront_lead_plots <- current_storefronts_df$`Storefront Code` %>%
+  setNames(current_storefronts_df$`Storefront Code`) %>%
+  future_map(create_storefront_lead_plot)
+
+# Show the first lead plot for validation
+storefront_lead_plots[[1]]
+
+# Create output directory if it doesn't exist
+dir.create("Storefront_Plots/Leads", showWarnings = TRUE)
+
+# Save each plot to a file in the correct sub-directory
+future_walk2(storefront_lead_plots, names(storefront_lead_plots), function(plot, code) {
+  storefront_name <- current_storefronts_df$Storefront[current_storefronts_df$`Storefront Code` == code]
+  
+  message(paste0("Saving lead plot for storefront ", storefront_name, " (", code, ")...\n"))
+  
+  filename <-
+    paste0(
+      "Storefront_Plots/Leads/",
+      code,
+      "_",
+      gsub("[^[:alnum:]]", "_", storefront_name),
+      "_leads",
+      ".png"
+    )
+  
+  # Try-catch block to handle any errors during save
+  tryCatch({
+    ggsave(
+      plot = plot,
+      filename,
+      ##### Use px for width and height and the correct dpi here #####
+      width = 5,
+      height = 2.5,
+      units = "in",
+      dpi = 144,
+      # path = paste0(here(), "/Storefront Plots"),
+      bg = "white"
+    )
+    message(paste0("  ✓ Successfully saved ", filename, "\n"))
+  }, error = function(e) {
+    message(paste0("  ✗ Error saving ", filename, ": ", e$message, "\n"))
+  })
+})
+```
+
+```{r Plot Channel Visits for Storefronts}
+# For QA & validation
+# storefront_channel_plots[names(storefront_channel_plots)]
+```
+
+```{r Storefront Migration Metrics Table}
+# This function creates a comprehensive dataset with all storefronts
+dynamic_storefront_comparison <- function(data, storefront_info, max_days = max_table_comparison_range) {
+  
+  # Seeting input variables for debugging
+  # data <- brand_visits_visitors_and_engaged_visits
+  # storefront_info <- current_storefronts_df
+  # max_days <- 30
+  
+  # Create a function to determine the appropriate comparison range for each storefront
+  get_storefront_comparison_range <- function(launch_date, max_days) {
+    days_since_launch <- as.integer(Sys.Date() - as.Date(launch_date))
+    post_days <- min(max_days, days_since_launch)
+    pre_days <- post_days
+    return(list(pre_days = pre_days, post_days = post_days))
+  }
+  
+  # Apply comparison range calculation to each storefront
+  storefront_ranges <- storefront_info %>%
+    mutate(
+      days_calc = map(`Launch Date`, ~get_storefront_comparison_range(., max_days)),
+      pre_days = map_dbl(days_calc, ~.$pre_days),
+      post_days = map_dbl(days_calc, ~.$post_days),
+      start_date = `Launch Date` - days(pre_days),
+      end_date = `Launch Date` + days(post_days)
+    )
+  
+  # Join the data with the storefront ranges and filter accordingly
+  result <- data %>%
+    inner_join(storefront_ranges, by = c("generic_var_1" = "Storefront Code")) %>%
+    filter(
+      hit_date >= start_date,
+      hit_date <= end_date
+    ) %>%
+    mutate(time_period = if_else(hit_date >= `Launch Date`, "post", "pre")) %>%
+    group_by(generic_var_1, Storefront, time_period, pre_days, post_days) %>%
+    # Calculate means and totals
+    summarize(
+      daily_visits = mean(visits, na.rm = TRUE),
+      total_visits = sum(visits, na.rm = TRUE),
+      daily_visitors = mean(visitors, na.rm = TRUE),
+      total_visitors = sum(visitors, na.rm = TRUE),
+      daily_product_detail_page_visits = mean(product_detail_page_visits, na.rm = TRUE),
+      total_product_detail_page_visits = sum(product_detail_page_visits, na.rm = TRUE),
+      daily_engaged_visits = mean(engaged_visits, na.rm = TRUE),
+      total_engaged_visits = sum(engaged_visits, na.rm = TRUE),
+      daily_primary_leads = mean(primary_lead_submission_visits, na.rm = TRUE),
+      total_primary_leads = sum(primary_lead_submission_visits, na.rm = TRUE),
+      daily_secondary_leads = mean(secondary_lead_submissions_visits, na.rm = TRUE),
+      total_secondary_leads = sum(secondary_lead_submissions_visits, na.rm = TRUE),
+      daily_total_leads = mean(primary_lead_submission_visits + secondary_lead_submissions_visits, na.rm = TRUE),
+      total_total_leads = sum(primary_lead_submission_visits + secondary_lead_submissions_visits, na.rm = TRUE),
+      days_with_data = n_distinct(hit_date),
+      .groups = "drop"
+    )
+  
+  # Helper functions for calculating safe percentage changes and ratios
+  safe_pct_change <- function(new_value, old_value) {
+    ifelse(old_value == 0 | is.na(old_value), NA_real_, ((new_value - old_value) / old_value) * 100)
+  }
+  
+  safe_ratio <- function(numerator, denominator) {
+    ifelse(denominator == 0 | is.na(denominator),
+           NA_real_,
+           (numerator / denominator))
+  }
+
+  # Get pre/post metrics side by side
+  wide_result <- result %>%
+    pivot_wider(
+      id_cols = c(generic_var_1, Storefront, pre_days, post_days),
+      names_from = time_period,
+      values_from = c(
+        daily_visits, total_visits,
+        daily_visitors, total_visitors,
+        daily_product_detail_page_visits, total_product_detail_page_visits,
+        daily_engaged_visits, total_engaged_visits,
+        daily_primary_leads, total_primary_leads,
+        daily_secondary_leads, total_secondary_leads,
+        daily_total_leads, total_total_leads,
+        days_with_data
+      )
+    ) %>%
+    # Calculate percentage changes for both daily and total metrics
+    mutate(
+      # Daily average percentage changes (for all_storefronts_summary)
+      visits_pct_change = safe_pct_change(daily_visits_post, daily_visits_pre),
+      visitor_pct_change = safe_pct_change(daily_visitors_post, daily_visitors_pre),
+      product_page_pct_change = safe_pct_change(daily_product_detail_page_visits_post, daily_product_detail_page_visits_pre),
+      engaged_visits_pct_change = safe_pct_change(daily_engaged_visits_post, daily_engaged_visits_pre),
+      primary_leads_pct_change = safe_pct_change(daily_primary_leads_post, daily_primary_leads_pre),
+      secondary_leads_pct_change = safe_pct_change(daily_secondary_leads_post, daily_secondary_leads_pre),
+      total_leads_pct_change = safe_pct_change(daily_total_leads_post, daily_total_leads_pre),
+      
+      # Total metrics percentage changes (for single storefront pivot tables)
+      total_visits_pct_change = safe_pct_change(total_visits_post, total_visits_pre),
+      total_visitors_pct_change = safe_pct_change(total_visitors_post, total_visitors_pre),
+      total_product_detail_page_pct_change = safe_pct_change(total_product_detail_page_visits_post, total_product_detail_page_visits_pre),
+      total_engaged_visits_pct_change = safe_pct_change(total_engaged_visits_post, total_engaged_visits_pre),
+      total_primary_leads_pct_change = safe_pct_change(total_primary_leads_post, total_primary_leads_pre),
+      total_secondary_leads_pct_change = safe_pct_change(total_secondary_leads_post, total_secondary_leads_pre),
+      total_total_leads_pct_change = safe_pct_change(total_total_leads_post, total_total_leads_pre),
+      
+      # Conversion rates
+      pre_secondary_cvr = safe_ratio(daily_secondary_leads_pre, daily_visits_pre),
+      post_secondary_cvr = safe_ratio(daily_secondary_leads_post, daily_visits_post),
+      secondary_cvr_pct_change = safe_pct_change(post_secondary_cvr, pre_secondary_cvr),
+      
+      pre_total_cvr = safe_ratio(daily_total_leads_pre, daily_visits_pre),
+      post_total_cvr = safe_ratio(daily_total_leads_post, daily_visits_post),
+      total_cvr_pct_change = safe_pct_change(post_total_cvr, pre_total_cvr)
+    ) %>%
+    # Join with storefront info to get launch dates
+    left_join(
+      storefront_info %>% select(`Storefront Code`, `Launch Date`, Status),
+      by = c("generic_var_1" = "Storefront Code")
+    ) %>%
+    # Add days since launch
+    mutate(days_since_launch = as.integer(Sys.Date() - as.Date(`Launch Date`)))
+  
+  return(wide_result)
+}
+
+# Generate the master table
+all_storefront_results <- dynamic_storefront_comparison(
+  brand_visits_visitors_and_engaged_visits,
+  current_storefronts_df,
+  max_days = max_table_comparison_range
+)
+
+# Verifying everything is working correctly w/ [REDACTED] as test case
+# data %>%
+#   inner_join(storefront_ranges, by = c("generic_var_1" = "Storefront Code")) %>% filter(generic_var_1 == "[REDACTED]") %>%
+#   filter(hit_date >= start_date, hit_date <= end_date) %>%
+#   mutate(time_period = if_else(hit_date >= `Launch Date`, "post", "pre")) %>% 
+#   select(hit_date, visits, Storefront, start_date, end_date, time_period)
+```
+
+```{r Single Storefront Pivot Table}
+# This function creates a nice table for a single storefront
+storefront_pivot_table <- function(storefront_code, storefront_data = all_storefront_results) {
+  # Font size variables for easy modification
+  title_font_size <- "12pt"
+  subtitle_font_size <- "10pt"
+  body_font_size <- "10pt"
+  header_font_size <- "10pt"
+  group_font_size <- "10pt"
+  cell_stub_font_size <- "10pt"
+  
+  # Get the storefront data from the pre-computed dataset
+  storefront_info <- storefront_data %>% filter(generic_var_1 == storefront_code)
+  
+  if(nrow(storefront_info) == 0) {
+    return(cat("No data found for storefront code:", storefront_code))
+  }
+  
+  # Extract metric pairs and clean things up for gt() input
+  metrics_table <- tibble(
+    "Metric" = c(
+      "Days in Analysis",
+      "Total Visits",
+      "Total Visitors",
+      "Total Product Detail Page Visits",
+      "Total Engaged Visits",
+      "Total Primary Leads",
+      "Total Secondary Leads",
+      "Total All Leads",
+      "Secondary Conversion Rate",
+      "Total Conversion Rate"
+    ),
+    "Pre-Migration" = c(
+      storefront_info$pre_days,
+      storefront_info$total_visits_pre,
+      storefront_info$total_visitors_pre,
+      storefront_info$total_product_detail_page_visits_pre,
+      storefront_info$total_engaged_visits_pre,
+      storefront_info$total_primary_leads_pre,
+      storefront_info$total_secondary_leads_pre,
+      storefront_info$total_total_leads_pre,
+      storefront_info$pre_secondary_cvr,
+      storefront_info$pre_total_cvr
+    ),
+    "Post-Migration" = c(
+      storefront_info$post_days,
+      storefront_info$total_visits_post,
+      storefront_info$total_visitors_post,
+      storefront_info$total_product_detail_page_visits_post,
+      storefront_info$total_engaged_visits_post,
+      storefront_info$total_primary_leads_post,
+      storefront_info$total_secondary_leads_post,
+      storefront_info$total_total_leads_post,
+      storefront_info$post_secondary_cvr,
+      storefront_info$post_total_cvr
+    ),
+    "Change" = c(
+      NA, # No change for days in analysis
+      storefront_info$total_visits_pct_change,
+      storefront_info$total_visitors_pct_change,
+      storefront_info$total_product_detail_page_pct_change,
+      storefront_info$total_engaged_visits_pct_change,
+      storefront_info$total_primary_leads_pct_change,
+      storefront_info$total_secondary_leads_pct_change,
+      storefront_info$total_total_leads_pct_change,
+      storefront_info$secondary_cvr_pct_change,
+      storefront_info$total_cvr_pct_change
+    ),
+    "Category" = c(
+      "Analysis Timeframe",
+      rep("Traffic Metrics", 4),
+      rep("Lead Metrics", 3),
+      rep("Conversion Metrics", 2)
+    )
+  )
+  
+  # Create the GT table using proper syntax for GT 0.9.0+
+  gt_table <- metrics_table %>%
+    gt(
+      groupname_col = "Category",
+      rowname_col = "Metric"
+    ) %>%
+    # cols_width(
+    #   Metric ~ px(120),
+    #   `Pre-Migration` ~ px(60),
+    #   `Post-Migration` ~ px(60),
+    #   Change ~ px(60)
+    # ) %>%
+    tab_header(
+      title = paste0(storefront_info$Storefront, " (", storefront_info$generic_var_1, ")"),
+      subtitle = paste0("Pre/Post Migration Comparison • Launch Date: ", format(storefront_info$`Launch Date`, "%B %d, %Y"))
+    ) %>%
+    # Format numbers based on metric type
+    fmt_number(
+      columns = c("Pre-Migration", "Post-Migration"),
+      rows = Metric == "Days in Analysis" | grepl("Total", Metric),
+      decimals = 0
+    ) %>%
+    fmt_percent(
+      columns = c("Pre-Migration", "Post-Migration"),
+      rows = Category == "Conversion Metrics",
+      decimals = 2,
+      scale_values = TRUE
+    ) %>%
+    fmt_percent(
+      columns = "Change",
+      rows = everything(),
+      decimals = 1,
+      scale_values = FALSE
+    ) %>%
+    # Handle NA values in the Change column
+    fmt_missing(
+      columns = "Change",
+      missing_text = "—"
+    ) %>%
+    # Add color coding for the Change column
+    tab_style(
+      style = cell_text(color = "#FF0000", font = "[BRAND] Type Variable", size = body_font_size),
+      locations = cells_body(
+        columns = "Change",
+        rows = Change < 0
+      )
+    ) %>%
+    tab_style(
+      style = cell_text(color = "#008000", font = "[BRAND] Type Variable", size = body_font_size),
+      locations = cells_body(
+        columns = "Change",
+        rows = Change > 0
+      )
+    ) %>%
+    tab_style(
+      style = cell_text(color = "#000000", font = "[BRAND] Type Variable", size = body_font_size),
+      locations = cells_body(
+        columns = "Change",
+        rows = Change == 0 | is.na(Change)
+      )
+    ) %>%
+    # Styling for group headers
+    tab_style(
+      style = list(
+        cell_text(font = "[BRAND] Type Variable", weight = "bold", size = group_font_size)
+      ),
+      locations = cells_row_groups()
+    ) %>%
+    # Styling for column headers
+    tab_style(
+      style = list(
+        cell_fill(color = "#F5F5F5"),
+        cell_text(font = "[BRAND] Type Variable", weight = "bold", size = header_font_size)
+      ),
+      locations = cells_column_labels()
+    ) %>%
+    # Styling for body cells
+    tab_style(
+      style = list(
+        cell_text(font = "[BRAND] Type Variable", size = body_font_size)
+      ),
+      locations = cells_body()
+    ) %>%
+    # Styling for title and subtitle
+    tab_style(
+      style = list(
+        cell_text(font = "[BRAND] Type Variable", size = title_font_size)
+      ),
+      locations = cells_title(groups = "title")
+    ) %>%
+    tab_style(
+      style = list(
+        cell_text(font = "[BRAND] Type Variable", size = subtitle_font_size)
+      ),
+      locations = cells_title(groups = "subtitle")
+    ) %>%
+    #  Styling the row names ("cells_sub") column
+    tab_style(
+    style = cell_text(
+      font = "[BRAND] Type Variable", 
+      size = cell_stub_font_size
+    ),
+    locations = cells_stub()
+  ) %>%
+    tab_options(
+      row_group.background.color = "#EEEEEE",
+      table.border.top.style = "hidden",
+      table.border.bottom.style = "hidden",
+      column_labels.border.bottom.width = px(2),
+      column_labels.border.bottom.color = "#D3D3D3",
+      row_group.border.top.width = px(2),
+      row_group.border.top.color = "#D3D3D3",
+      row_group.border.bottom.width = px(1),
+      row_group.border.bottom.color = "#D3D3D3",
+      table.width = pct(100)
+    )
+  
+  return(gt_table)
+}
+
+# Create a directory for the GT tables if it doesn't exist
+dir.create("Storefront_Tables", showWarnings = TRUE)
+
+# Get all storefront codes
+storefront_codes <- current_storefronts_df$`Storefront Code`
+
+# Function to save a single storefront table as PNG
+save_storefront_table_as_png <- function(code, output_dir = "Storefront_Tables/") {
+  storefront_name <- current_storefronts_df$Storefront[current_storefronts_df$`Storefront Code` == code]
+  
+  # Message output to track progress
+  message(sprintf("Saving table for storefront %s (%s)...\n", storefront_name, code))
+  
+  filename <- paste0(output_dir,
+                     code,
+                     "_",
+                     gsub("[^[:alnum:]]", "_", storefront_name),
+                     "_table.png")
+  
+  # Try-catch block to handle any errors
+  tryCatch({
+    storefront_table <- storefront_pivot_table(code)
+    tmp_html_file <- tempfile(fileext = ".html")
+    gt::gtsave(storefront_table, filename = tmp_html_file)
+    
+    webshot::webshot(
+      url = tmp_html_file,
+      file = filename,
+      vwidth = 700,
+      vheight = 550,
+      # Higher resolution
+      zoom = 2,
+      cliprect = c(0, 0, 700, 550)
+    )
+    
+    message(paste0("✓ Successfully saved ", filename, "\n"))
+  }, error = function(e) {
+    message(paste0("✗ Error saving table for ", storefront_name, ": ", e$message, "\n"))
+  })
+}
+
+# Generate a table for one storefront
+storefront_pivot_table("[REDACTED]")
+save_storefront_table_as_png("[REDACTED]")
+
+# Use future walk to create and save a table for each storefront using multiple R sessions
+future_walk(storefront_codes, function(code) {
+  save_storefront_table_as_png(code)
+})
+```
+
+```{r Storefront Migration KPI Summary Table}
+# Generate a summary of all storefronts with deltas
+
+# Function to create a summary table of all storefronts
+create_all_storefronts_summary <- function(storefront_data = all_storefront_results, min_label_threshold = 20) {
+  # Create a summary table showing storefronts with significant changes
+  storefront_data %>%
+    # Calculate whether changes are significant
+    mutate(
+      significant_visits = abs(visits_pct_change) >= min_label_threshold,
+      significant_primary_leads = abs(primary_leads_pct_change) >= min_label_threshold,
+      significant_secondary_leads = abs(secondary_leads_pct_change) >= min_label_threshold,
+      significant_total_leads = abs(total_leads_pct_change) >= min_label_threshold,
+      significant_cvr = abs(secondary_cvr_pct_change) >= min_label_threshold,
+      
+      # Classify storefronts by performance (now using total leads instead of just secondary)
+      performance_category = case_when(
+        visits_pct_change >= min_label_threshold & total_leads_pct_change >= min_label_threshold ~ "Both Up",
+        visits_pct_change >= min_label_threshold & total_leads_pct_change <= -min_label_threshold ~ "Visits Up, Leads Down",
+        visits_pct_change <= -min_label_threshold & total_leads_pct_change >= min_label_threshold ~ "Visits Down, Leads Up",
+        visits_pct_change <= -min_label_threshold & total_leads_pct_change <= -min_label_threshold ~ "Both Down",
+        TRUE ~ "Mixed/Minor Change"
+      )
+    ) %>%
+    # Filter to storefronts with at least 7 days of data each period
+    # filter(
+    #   pre_days >= 7,
+    #   post_days >= 7
+    # ) %>%
+    # Select relevant columns for the summary
+    select(
+      Storefront,
+      generic_var_1,
+      Status,
+      days_since_launch,
+      performance_category,
+      pre_days,
+      post_days,
+      daily_visits_pre,
+      daily_visits_post,
+      visits_pct_change,
+      daily_secondary_leads_pre,
+      daily_secondary_leads_post,
+      secondary_leads_pct_change,
+      daily_total_leads_pre,
+      daily_total_leads_post,
+      total_leads_pct_change,
+      pre_secondary_cvr,
+      post_secondary_cvr,
+      secondary_cvr_pct_change
+    ) %>%
+    # Order by most significant changes overall
+    arrange(desc(abs(visits_pct_change) + abs(total_leads_pct_change)))
+}
+
+# This threshold only affects "Performance Category"
+all_storefronts_summary <- create_all_storefronts_summary(min_label_threshold = perf_threshold)
+
+# Create a GT table from the summary
+all_storefronts_summary_gt <- all_storefronts_summary %>%
+  # Order by days since launch
+  arrange(days_since_launch) %>%
+  gt() %>%
+  cols_width(
+    days_since_launch ~ px(60)
+  ) %>%
+  tab_header(
+    title = md("**Site Migration Storefront KPI Summary**")
+  ) %>%
+  cols_label(
+    Storefront = "Storefront",
+    generic_var_1 = "Storefront Code",
+    days_since_launch = "Days Since Launch",
+    performance_category = "Performance Category",
+    pre_days = "Pre Days",
+    post_days = "Post Days",
+    daily_visits_pre = "Pre",
+    daily_visits_post = "Post",
+    visits_pct_change = "%Δ",
+    daily_secondary_leads_pre = "Pre",
+    daily_secondary_leads_post = "Post",
+    secondary_leads_pct_change = "%Δ",
+    daily_total_leads_pre = "Pre",
+    daily_total_leads_post = "Post",
+    total_leads_pct_change = "%Δ",
+    pre_secondary_cvr = "Pre",
+    post_secondary_cvr = "Post",
+    secondary_cvr_pct_change = "%Δ"
+  ) %>%
+  # Spanners
+  tab_spanner(
+    label = "Storefront Info",
+    columns = c(Storefront, generic_var_1, Status, days_since_launch, performance_category)
+  ) %>%
+  tab_spanner(
+    label = "Period",
+    columns = c(pre_days, post_days)
+  ) %>%
+  tab_spanner(
+    label = "Daily Visits",
+    columns = c(daily_visits_pre, daily_visits_post, visits_pct_change)
+  ) %>%
+  tab_spanner(
+    label = "Daily Secondary Leads",
+    columns = c(daily_secondary_leads_pre, daily_secondary_leads_post, secondary_leads_pct_change)
+  ) %>%
+  tab_spanner(
+    label = "Daily Total Leads",
+    columns = c(daily_total_leads_pre, daily_total_leads_post, total_leads_pct_change)
+  ) %>%
+  tab_spanner(
+    label = "Secondary Conversion Rate",
+    columns = c(pre_secondary_cvr, post_secondary_cvr, secondary_cvr_pct_change)
+  ) %>%
+  fmt_number(
+    columns = c(pre_days, post_days, days_since_launch),
+    decimals = 0
+  ) %>%
+  fmt_number(
+    columns = c(daily_visits_pre, daily_visits_post,
+                daily_secondary_leads_pre, daily_secondary_leads_post,
+                daily_total_leads_pre, daily_total_leads_post),
+    decimals = 1
+  ) %>%
+  fmt_missing(
+    columns = ends_with("_pct_change"),
+    missing_text = "—"
+  ) %>%
+  fmt_percent(
+    columns = c(visits_pct_change, secondary_leads_pct_change, total_leads_pct_change, secondary_cvr_pct_change),
+    decimals = 1,
+    scale_values = FALSE
+  ) %>%
+  fmt_percent(
+    columns = c(pre_secondary_cvr, post_secondary_cvr),
+    decimals = 2,
+    scale_values = TRUE
+  ) %>%
+  # Color code the change columns
+  tab_style(
+    style = cell_text(color = "#FF0000", font = "[BRAND] Type Variable"),
+    locations = cells_body(
+      columns = c(visits_pct_change),
+      rows = visits_pct_change < 0
+    )
+  ) %>%
+  tab_style(
+    style = cell_text(color = "#008000", font = "[BRAND] Type Variable"),
+    locations = cells_body(
+      columns = c(visits_pct_change),
+      rows = visits_pct_change > 0
+    )
+  ) %>%
+  tab_style(
+    style = cell_text(color = "#FF0000", font = "[BRAND] Type Variable"),
+    locations = cells_body(
+      columns = secondary_leads_pct_change,
+      rows = secondary_leads_pct_change < 0
+    )
+  ) %>%
+  tab_style(
+    style = cell_text(color = "#008000", font = "[BRAND] Type Variable"),
+    locations = cells_body(
+      columns = secondary_leads_pct_change,
+      rows = secondary_leads_pct_change > 0
+    )
+  ) %>%
+  tab_style(
+    style = cell_text(color = "#FF0000", font = "[BRAND] Type Variable"),
+    locations = cells_body(
+      columns = total_leads_pct_change,
+      rows = total_leads_pct_change < 0
+    )
+  ) %>%
+  tab_style(
+    style = cell_text(color = "#008000", font = "[BRAND] Type Variable"),
+    locations = cells_body(
+      columns = total_leads_pct_change,
+      rows = total_leads_pct_change > 0
+    )
+  ) %>%
+  tab_style(
+    style = cell_text(color = "#FF0000", font = "[BRAND] Type Variable"),
+    locations = cells_body(
+      columns = secondary_cvr_pct_change,
+      rows = secondary_cvr_pct_change < 0
+    )
+  ) %>%
+  tab_style(
+    style = cell_text(color = "#008000", font = "[BRAND] Type Variable"),
+    locations = cells_body(
+      columns = secondary_cvr_pct_change,
+      rows = secondary_cvr_pct_change > 0
+    )
+  ) %>%
+  # Style the performance category
+  tab_style(
+    style = cell_fill(color = "#DDFFDD"),
+    locations = cells_body(
+      columns = performance_category,
+      rows = performance_category == "Both Up"
+    )
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "#FFDDDD"),
+    locations = cells_body(
+      columns = performance_category,
+      rows = performance_category == "Both Down"
+    )
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "#FFFFDD"),
+    locations = cells_body(
+      columns = performance_category,
+      rows = performance_category %in% c("Visits Up, Leads Down", "Visits Down, Leads Up")
+    )
+  ) %>%
+  # Style the spanners
+  tab_style(
+    style = list(
+      cell_text(font = "[BRAND] Type Variable", weight = "bold"),
+      cell_fill(color = "#F5F5F5")
+    ),
+    locations = cells_column_spanners()
+  ) %>%
+  # Add borders between metric groups
+  tab_style(
+    style = cell_borders(
+      sides = "right",
+      color = "#D3D3D3",
+      weight = px(2)
+    ),
+    locations = cells_body(
+      columns = c(performance_category, post_days, visits_pct_change, secondary_leads_pct_change, 
+                 total_leads_pct_change)
+    )
+  ) %>%
+  # Add visual separation with borders for labels too
+  tab_style(
+    style = cell_borders(
+      sides = "right",
+      color = "#D3D3D3",
+      weight = px(2)
+    ),
+    locations = cells_column_labels(
+      columns = c(performance_category, post_days, visits_pct_change, secondary_leads_pct_change, 
+                 total_leads_pct_change)
+    )
+  )
+
+all_storefronts_summary_gt
+
+# Create output directory if it doesn't exist
+dir.create("Full_Reports", showWarnings = FALSE)
+
+# Rename secondary conversion rate to total lead submits over site visits
+# Save the GT table as HTML using a temporary file
+tmp_html_file <- tempfile(fileext = ".html")
+gt::gtsave(all_storefronts_summary_gt, filename = tmp_html_file)
+
+# Take the screenshot with adequate width
+webshot::webshot(
+  url = tmp_html_file,
+  file = "Full_Reports/Site_Storefront_Migration_KPI_Summary.png",
+  vwidth = 1600,
+  vheight = 1600,
+  # Higher resolution
+  zoom = 2,
+  # Explicit clipping rectangle
+  cliprect = c(0, 0, 1600, 1600)  
+)
+
+# Save as xlsx
+# library(openxlsx)
+# 
+# # With options
+# write.xlsx(all_storefronts_summary, paste0("Full_Reports/Site_Storefront_Migration_KPI_Summary_",Sys.Date(),".xlsx"), 
+#            sheetName = "MyData",
+#            rowNames = FALSE,
+#            colNames = TRUE,
+#            asTable = FALSE)
+```
+
+```{r Generate Storefront Report}
+generate_storefront_report <- function(code, output_dir = NULL) {
+  # Get storefront name
+  storefront_name <- current_storefronts_df$Storefront[current_storefronts_df$`Storefront Code` == code]
+  sanitized_name <- gsub("[^[:alnum:]]", "_", storefront_name)
+  
+  # Create a unique template filename for this process
+  temp_template <- paste0("temp_template_", code, ".qmd")
+  
+  # Copy the template to a unique name
+  file.copy("Site_Storefront_Report_Template.qmd",
+            temp_template,
+            overwrite = TRUE)
+  
+  # Set up cleanup to ensure temp files are removed
+  on.exit({
+    # Clean up various possible temp files
+    temp_files <- c(
+      temp_template,
+      # QMD template
+      gsub("\\.qmd$", ".pdf", temp_template),
+      # PDF output
+      gsub("\\.qmd$", ".typ", temp_template),
+      # Typst output
+      "Site_Storefront_Report_Template.typ"       # Default TYP file
+    )
+    
+    for (f in temp_files) {
+      if (file.exists(f)) {
+        file.remove(f)
+        # Making sure this is working
+        # message(paste("Cleaned up", f))
+      }
+    }
+  }, add = TRUE)
+  
+  # Create a list to hold template variables
+  template_vars <- list()
+  
+  # Image paths for branding
+  template_vars["poweredbyAnalytics"] <- "www/PoweredByAnalytics.jpg"
+  template_vars["brandImageLarge"] <- "www/Data-BlueGray.png"
+  
+  # Basic report information
+  template_vars["title"] <- storefront_name
+  
+  # File paths for plots and tables
+  template_vars["channelPlot"] <- paste0("Storefront_Plots/Channel/",
+                                         code,
+                                         "_",
+                                         sanitized_name,
+                                         "_visits.png")
+  template_vars["leadPlot"] <- paste0("Storefront_Plots/Leads/",
+                                      code,
+                                      "_",
+                                      sanitized_name,
+                                      "_leads.png")
+  template_vars["tableTest"] <- paste0("Storefront_Tables/", code, "_", sanitized_name, "_table.png")
+  
+  # Values for the valueboxes
+  template_vars["startDate"] <- format(as.Date(current_storefronts_df$`Launch Date`[current_storefronts_df$`Storefront Code` == code]), "%Y-%m-%d")
+  template_vars["daysSinceLaunch"] <- as.character(as.numeric(Sys.Date() - as.Date(current_storefronts_df$`Launch Date`[current_storefronts_df$`Storefront Code` == code])))
+  
+  # Create a unique output filename
+  output_filename <- paste0(code, "_", sanitized_name, ".pdf")
+  
+  # Determine the final path
+  if (!is.null(output_dir)) {
+    dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+    final_path <- file.path(output_dir, output_filename)
+  } else {
+    final_path <- output_filename
+  }
+  
+  # Render using the unique template file
+  quarto::quarto_render(input = temp_template, output_file = output_filename, metadata = template_vars)
+  
+  # Move final report to its final location
+  if (file.exists(output_filename)) {
+    file.copy(output_filename, final_path, overwrite = TRUE)
+    file.remove(output_filename)
+    return(final_path)
+  } else {
+    warning(paste("Could not find rendered file:", output_filename))
+    return(NULL)
+  }
+}
+# Example for a single storefront:
+report_file <- generate_storefront_report("[REDACTED]", output_dir = "storefront_reports")
+```
+
+```{r Generate All Storefront Reports and Full Report}
+# Generate the reports for all storefronts using parallelization
+future_walk(current_storefronts_df$`Storefront Code`, function(code) {
+  storefront_name <- current_storefronts_df$Storefront[current_storefronts_df$`Storefront Code` == code]
+  message(paste("Generating report for", storefront_name, "(" , code, ")"))
+  generate_storefront_report(code, output_dir = "Storefront_Reports")
+}, .progress = TRUE)
+
+# Order by launch date again since parallelization messes this up
+report_files_ordered <- current_storefronts_df %>%
+  mutate(report_path_name = paste0(
+    "storefront_reports/",
+    `Storefront Code`,
+    "_",
+    gsub("[^[:alnum:]]", "_", Storefront),
+    ".pdf"
+  )) %>%
+  arrange((`Launch Date`))
+
+# Create output directory if it doesn't exist, but it should :)
+dir.create("Full_Reports", showWarnings = FALSE)
+# Create a master report by merging all the storefront reports into one file
+pdftools::pdf_combine(report_files_ordered$report_path_name, output = "Full_Reports/All_Storefronts_Report.pdf")
+
+# Final beep to alert the analyst it is done
+beepr::beep()
+# Annnnd time!
+toc()
+```

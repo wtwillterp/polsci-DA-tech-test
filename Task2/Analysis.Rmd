@@ -1,0 +1,555 @@
+---
+author: William Terpstra
+date: !r Sys.Date()
+title: "Task 2: Data Analysis and Visualization"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(extrafont)
+library(scales)
+library(here)
+
+# Import fonts from the local directory
+font_import(paths = paste0(here(),"/fonts"), prompt = FALSE)
+loadfonts(quiet = TRUE)
+
+dpi_var <- 300
+
+# Custom theme function
+wills_minimal_theme <- function() {
+  font <- "Futura-Book"
+  theme_minimal() %+replace%
+  theme(
+    # Text
+    text = element_text(family = font, size = 12),
+    plot.title = element_text(family = font, size = 16, hjust = 0, margin = margin(b = 10)),
+    plot.subtitle = element_text(family = font, size = 12, hjust = 0),
+    plot.title.position = "plot",
+    plot.margin = margin(r = 35),
+    axis.title.x = element_text(size = 12, color = "grey30"),
+    axis.title.y = element_text(size = 12, color = "grey30"),
+    legend.title = element_blank(),
+    legend.text = element_text(margin = margin(r = 25), size = 12, color = "grey30"),
+    plot.caption = element_text(family = font, size = 10, hjust = 0, color = "grey30", margin = margin(t = 20)),
+    plot.caption.position = "plot",
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    legend.spacing.x = unit(1, "mm"),
+    strip.text = element_text(color = "grey30"),
+    legend.position = "top"
+  )
+}
+
+palette <- list(
+  darkgreen = "#41ab5d",    # Original dark green
+  green = "#2f9850",        # Darker green
+  lightgreen = "#8fb73d",   # Darker light green
+  yellow = "#ffc04d",       # Darker yellow
+  lightorange = "#ffa64d",  # Darker light orange
+  orange = "#ff8533",        # Darker orange
+  darkorange = "#ff6619",   # Darker dark orange
+  red = "#ff5533"          # Reddish orange
+)
+
+img_sub_dir <- "/img"
+```
+
+```{r Load Data}
+# Pull all the csvs in
+csv_paths <- list.files(path = paste0(here(), "/data"), 
+                        pattern = "*.csv", 
+                        full.names = TRUE)
+# Give them names
+names(csv_paths) <- vapply(csv_paths, function(x) {
+  gsub(paste0(here(),"/data/(.*)\\.csv"), "\\1", x, ignore.case = TRUE)
+}, character(1))
+
+df_list <- list()
+
+for (name in names(csv_paths)) {
+  file_path <- csv_paths[name]
+  df <- read.csv(file_path)
+  
+  # Create a list of dataframes for each file
+  df_list[[name]] <- df
+  
+  # But also a dataframe I decided since using the list is a bit messy
+  assign(name, df, envir = .GlobalEnv)
+}
+```
+
+```{r Quick Data Munging}
+# One of my first R functions I ever wrote
+NAcheck <- function(df) {
+  names <- c()
+  percent_of_missing_values <- c()
+  for(i in 1:ncol(df)) { # for-loop over columns in the data frame
+    
+    #adding the name of each column to a vector
+    names <- append(names, colnames(df[i]))
+    #adding the amount of missing values of each column to a vector
+    percent_of_missing_values <- append(percent_of_missing_values, scales::percent(sum(is.na(df[,i]))/nrow(df), .001))
+  }
+  #using the two vectors to output a data frame 
+  #with the names of columns and their amount of missing values
+  data.frame(names, percent_of_missing_values)
+}
+
+# looks like there is a few missing values in bills
+df_list %>% map(~ NAcheck(.))
+
+# Okay looks like an ingestion issue, blame Ryan smh
+bills[is.na(bills$bill_number), ]
+bills[is.na(bills$congress), ]
+
+# Confirming these are erroneous values in the fields
+# also going forward only using the sweet comfort of dplyr
+bills %>% distinct(bill_id) %>% head(10)
+bills %>% count(bill_type) %>% head(10)
+
+# I'm just going to filter these bad rows out for now
+df_list$bills <- df_list$bills %>% filter(!is.na(bill_number))
+bills <- bills %>% filter(!is.na(bill_number))
+```
+
+```{r Importance}
+# Tracking off pace on a busy day so I think I'm just going to go with total money as importance
+# But how do we attribute money when it is at the filing level?
+# I will make the naive assumption that the money is spread across bills evenly
+
+# Looks like a bill can appear multiple times in a filing
+filings_bills %>%
+  group_by(filing_uuid, bill_id) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  filter(count > 1) %>%
+  head(10)
+
+# Looks like this is due to a bill having multiple general_issue_codes
+filings_bills %>% 
+  filter(filing_uuid == "0003f56e-2c1f-4082-874d-d90df15615a4") %>%
+  arrange(bill_id)
+
+# Let's pull amount by bill using this naive amount attribution methodology
+filings_bills_with_committees <- filings_bills %>%
+  inner_join(bills_committees_distinct, by = "bill_id") %>%
+  select(filing_uuid, bill_id, committee_id)
+
+# Now we need to join this to committees so we can sum lobbying amounts
+# But alas looks like a bill can appear multiple times in a committee
+# so we need to make that distinct
+bills_committees %>%
+  group_by(committee_id, bill_id) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  filter(count > 1)
+
+# Looks like a bill can appear across multiple committees, as expected
+bills_committees %>%
+  group_by(bill_id) %>%
+  mutate(distinct_committee_count = n_distinct(committee_id)) %>%
+  distinct(bill_id, distinct_committee_count) %>% 
+  arrange(-distinct_committee_count)
+
+# And bills can also occur in the same committee multiple times
+bills_committees %>%
+  group_by(committee_id) %>%
+  summarize(distinct_bill_count = n_distinct(bill_id),
+            bill_count = n()) %>%
+  select(committee_id, distinct_bill_count, bill_count) %>%
+  filter(distinct_bill_count != bill_count) %>%
+  mutate(reoccuring_bills = bill_count - distinct_bill_count) %>%
+  arrange(-reoccuring_bills)
+
+# Welp I think I could get away with a naiver attribution methodology but
+# I think it makes sense if the bill amounts actually sum up to the totals
+# so now I need to further divide bill amounts across the committees where they appear
+bills_committees_distinct <- bills_committees %>% distinct(committee_id, bill_id)
+
+# Calculate the total bill-committee pairs for each filing
+filing_attribution_counts <- filings_bills_with_committees %>%
+  group_by(filing_uuid) %>%
+  summarize(total_pairs = n())
+
+# Attribute amounts to committees
+# Previously I attributed amounts to bills and then bills to committees
+# but since some bills weren't taken up by committees that resulted in a methodology where
+# some money wasn't attributed to a committee. Now that is a valid methodology
+# but I prefer this one where if you sum all the committee amounts up you match
+# the total amount of filings
+committee_amt <- filings %>%
+  inner_join(filings_bills_with_committees) %>%
+  inner_join(filing_attribution_counts) %>%
+  mutate(amount = as.numeric(gsub("[\\$,]", "", amount)),
+         committee_amount = amount / total_pairs) %>%
+  group_by(committee_id) %>%
+  summarize(total_lobbying_amount = sum(committee_amount, na.rm = TRUE)) %>%
+  arrange(-total_lobbying_amount)
+
+# Verify things sum up as expected
+raw_filing_total_amount <- filings %>%
+  inner_join(filings_bills_with_committees %>% distinct(filing_uuid)) %>%
+  mutate(amount = as.numeric(gsub("[\\$,]", "", amount))) %>% 
+  summarize(sum(amount, na.rm = TRUE))
+
+committee_distributed_total_amount <- sum(committee_amt$total_lobbying_amount)
+
+message(paste("Original sum:", raw_filing_total_amount, "Committee sum:", committee_distributed_total_amount))
+
+
+```
+
+```{r Visualize Importance by Lobbying Amount}
+# Visualizing top committees by lobbying amount
+committee_amt %>%
+  left_join(committees) %>%
+  head(10) %>%
+  ggplot(aes(
+    x = total_lobbying_amount,
+    y = reorder(committee_name, total_lobbying_amount)
+  )) +
+  geom_col(fill = palette$darkgreen) +
+  scale_x_continuous(labels = \(x) scales::comma(x, prefix = "$")) +
+  wills_minimal_theme() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    plot.caption = element_text(
+      margin = margin(t = 20),
+      hjust = 0,
+      size = 10
+    ),
+    plot.caption.position = "plot"
+  ) +
+  labs(
+    title = paste0("Top 10 Committees by Importance (Total Lobbying Amount)"),
+    y = "",
+    x = "Total Lobbying Amount",
+    caption = "Lobbying amount is attributed to committees by being equally divided across bills in filings"
+  ) +
+  geom_text(
+    aes(
+      x = 3000000,
+      label = stringr::str_replace(committee_name, " on ", "\non ")
+    ),
+    hjust = 0,
+    family = "Futura-Book",
+    size = 10 / .pt,
+    color = "white"
+  ) +
+  geom_text(
+    aes(
+      x = total_lobbying_amount,
+      label = if_else(
+        total_lobbying_amount <= max(total_lobbying_amount) * .75,
+        scales::comma(
+          total_lobbying_amount / 1000000,
+          prefix = "$",
+          suffix = "M",
+          accuracy = 1
+        ),
+        ""
+      )
+    ),
+    hjust = -.1,
+    family = "Futura-Book",
+    size = 10 / .pt,
+    color = "grey30"
+  ) +
+  geom_text(
+    aes(
+      x = total_lobbying_amount,
+      label = if_else(
+        total_lobbying_amount > max(total_lobbying_amount) * .75,
+        scales::comma(
+          total_lobbying_amount / 1000000,
+          prefix = "$",
+          suffix = "M",
+          accuracy = 1
+        ),
+        ""
+      )
+    ),
+    hjust = 1.1,
+    family = "Futura-Book",
+    size = 10 / .pt,
+    color = "white"
+  ) +
+  coord_cartesian(clip = "off")
+
+ggsave(paste0("Committee_Important_Amount.png"),
+       bg = "white",
+       width = 10,
+       height = 8,
+       units = "in",
+       dpi = dpi_var,
+       path = paste0(here(), img_sub_dir))
+
+```
+
+```{r Visualize Distinct Bills}
+# The alternative method suggested
+# Looking at distinct bills passed
+top10_committees_dist_bills <- bills_committees %>%
+  group_by(committee_id) %>%
+  summarize(distinct_bill_count = n_distinct(bill_id)) %>%
+  arrange(-distinct_bill_count) %>%
+  left_join(committees) %>%
+  head(10)
+
+top10_committees_dist_bills %>%
+  ggplot(aes(
+    x = distinct_bill_count,
+    y = reorder(committee_name, distinct_bill_count)
+  )) +
+  geom_col(fill = palette$darkgreen) +
+  scale_x_continuous(labels = \(x) scales::comma(x)) +
+  wills_minimal_theme() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    plot.caption = element_text(
+      margin = margin(t = 20),
+      hjust = 0,
+      size = 10
+    ),
+    plot.caption.position = "plot"
+  ) +
+  labs(
+    title = paste0("Top 10 Committees by Distinct Bills"),
+    y = "",
+    x = "Distinct Bills",
+    caption = ""
+  ) +
+  geom_text(
+    aes(
+      x = 100,
+      label = stringr::str_replace(committee_name, " on ", "\non ")
+    ),
+    hjust = 0,
+    family = "Futura-Book",
+    size = 10 / .pt,
+    color = "white"
+  ) +
+  geom_text(
+    aes(
+      x = distinct_bill_count,
+      label = if_else(
+        distinct_bill_count <= max(distinct_bill_count) * .75,
+        scales::comma(
+          distinct_bill_count,
+          accuracy = 1
+        ),
+        ""
+      )
+    ),
+    hjust = -.1,
+    family = "Futura-Book",
+    size = 10 / .pt,
+    color = "grey30"
+  ) +
+  geom_text(
+    aes(
+      x = distinct_bill_count,
+      label = if_else(
+        distinct_bill_count > max(distinct_bill_count) * .75,
+        scales::comma(
+          distinct_bill_count,
+          accuracy = 1
+        ),
+        ""
+      )
+    ),
+    hjust = 1.1,
+    family = "Futura-Book",
+    size = 10 / .pt,
+    color = "white"
+  ) +
+  coord_cartesian(clip = "off")
+
+ggsave(paste0("Committee_Distinct_Bills.png"),
+       bg = "white",
+       width = 10,
+       height = 8,
+       units = "in",
+       dpi = dpi_var,
+       path = paste0(here(), img_sub_dir))
+```
+
+
+```{r Visualize Distinct Bills Passed}
+# It would be easy to then visualize committees with the most
+# distinct bills passed so let's try that
+committees_dist_bills_passed <- bills %>% 
+  filter(status == "passed") %>%
+  distinct(bill_id) %>% inner_join(bills_committees) %>%
+  group_by(committee_id) %>%
+  summarize(distinct_bill_count = n_distinct(bill_id)) %>%
+  arrange(-distinct_bill_count) %>%
+  left_join(committees)
+
+
+committees_dist_bills_passed %>%
+  head(10) %>%
+  ggplot(aes(
+    x = distinct_bill_count,
+    y = reorder(committee_name, distinct_bill_count)
+  )) +
+  geom_col(fill = palette$darkgreen) +
+  scale_x_continuous(labels = \(x) scales::comma(x)) +
+  wills_minimal_theme() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    plot.caption = element_text(
+      margin = margin(t = 20),
+      hjust = 0,
+      size = 10
+    ),
+    plot.caption.position = "plot"
+  ) +
+  labs(
+    title = paste0("Top 10 Committees by Distinct Bills Passed"),
+    y = "",
+    x = "Distinct Bills Passed",
+    caption = ""
+  ) +
+  geom_text(
+    aes(
+      x = 4,
+      label = stringr::str_replace(committee_name, " on ", "\non ")
+    ),
+    hjust = 0,
+    family = "Futura-Book",
+    size = 10 / .pt,
+    color = "white"
+  ) +
+  geom_text(
+    aes(
+      x = distinct_bill_count,
+      label = if_else(
+        distinct_bill_count <= max(distinct_bill_count) * .75,
+        scales::comma(
+          distinct_bill_count,
+          accuracy = 1
+        ),
+        ""
+      )
+    ),
+    hjust = -.1,
+    family = "Futura-Book",
+    size = 10 / .pt,
+    color = "grey30"
+  ) +
+  geom_text(
+    aes(
+      x = distinct_bill_count,
+      label = if_else(
+        distinct_bill_count > max(distinct_bill_count) * .75,
+        scales::comma(
+          distinct_bill_count,
+          accuracy = 1
+        ),
+        ""
+      )
+    ),
+    hjust = 1.1,
+    family = "Futura-Book",
+    size = 10 / .pt,
+    color = "white"
+  ) +
+  coord_cartesian(clip = "off")
+
+ggsave(paste0("Committee_Distinct_Bills_Passed.png"),
+       bg = "white",
+       width = 10,
+       height = 8,
+       units = "in",
+       dpi = dpi_var,
+       path = paste0(here(), img_sub_dir))
+```
+
+```{r Rank Change}
+# Let's make a quick plot that looks at rank change
+# from the amount methodology to the distinct passed bills methodology
+committee_amt %>%
+  left_join(committees) %>%
+  mutate(amt_rank = row_number()) %>%
+  left_join(committees_dist_bills_passed %>%
+  mutate(pass_rank = row_number()) %>% 
+  select(committee_name, distinct_bill_count, pass_rank)) %>%
+  mutate(rank_delta = amt_rank - pass_rank) %>%
+  head(10) %>%
+  ggplot(aes(
+    x = rank_delta,
+    y = reorder(committee_name, amt_rank),
+    fill = case_when(rank_delta < 0 ~ "negative",
+                            TRUE ~ "non-negative")
+  )) +
+  geom_col() +
+  scale_fill_manual(values = c("negative" = palette$red, "non-negative" = palette$green)) +
+  scale_x_continuous(labels = \(x) scales::comma(x)) +
+  wills_minimal_theme() +
+  theme(
+    axis.text.x = element_blank(),
+    plot.caption = element_text(
+      margin = margin(t = 20),
+      hjust = 0,
+      size = 10
+    ),
+    legend.position = "none",
+    plot.caption.position = "plot"
+  ) +
+  labs(
+    title = paste0("Top 10 Committees Importance Shift"),
+    y = "",
+    x = "Importance Rank Change",
+    caption = "Shift in importance rank when changing methodology from lobbying amount to distinct bills passed"
+  ) +
+  geom_text(
+    aes(
+      x = rank_delta,
+      label = if_else(
+        rank_delta <= 0,
+        scales::comma(
+          rank_delta,
+          accuracy = 1
+        ),
+        ""
+      )
+    ),
+    hjust = -.2,
+    family = "Futura-Book",
+    size = 10 / .pt,
+    color = "grey30"
+  ) +
+  geom_text(
+    aes(
+      x = rank_delta,
+      label = if_else(
+        rank_delta > 0,
+        scales::comma(
+          rank_delta,
+          accuracy = 1
+        ),
+        ""
+      )
+    ),
+    hjust = 1.5,
+    family = "Futura-Book",
+    size = 10 / .pt,
+    color = "white"
+  ) +
+  coord_cartesian(clip = "off")
+
+ggsave(paste0("Committee_Importance_Rank_Shift.png"),
+       bg = "white",
+       width = 10,
+       height = 8,
+       units = "in",
+       dpi = dpi_var,
+       path = paste0(here(), img_sub_dir))
+```
+
